@@ -1,0 +1,11 @@
+V0.5 20 FEB 2019
+
+# Changing jwilder/nginx-proxy with docker-compose that contain three containers under nginx-ssl-container.
+# Making YML library local instead fo remote git repository.
+# Adding new SSL YML.
+# Add dockerme directly under /user/bin in install command and remove that when deleting dockerme.
+# Remove YML update functionality since YML becoming a local directory.
+# Remove incompleted backup functionality.
+# Add "dockerme -update" command that will be active in the next release.
+
+-------------------------------------------------------------------------------------------------------------

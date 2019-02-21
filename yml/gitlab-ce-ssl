@@ -1,0 +1,15 @@
+version: "2"
+services:
+  $host:
+    container_name: $host
+    image: gitlab/gitlab-ce:latest
+    restart: always
+    volumes:
+      - $path/$host/config:/etc/gitlab
+      - $path/$host/logs:/var/log/gitlab
+      - $path/$host/data:/var/opt/gitlab
+    environment:
+      VIRTUAL_HOST: $host
+      LETSENCRYPT_HOST: $host
+      LETSENCRYPT_EMAIL: mindengineering.tn@gmail.com
+    network_mode: bridge

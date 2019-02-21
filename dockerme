@@ -1,0 +1,1562 @@
+#!/bin/bash
+DOCKERME_SHOW_HELP(){
+	cat << "EOF"
+          Usage: dockerme -argument option1 option2 --subarguments          
+           
+              dockerme -i / -u --all                      install dockerme / remove all        
+              dockerme -yml --list 			  list of yml files  
+              dockerme -c/-o domainename.tld yml          create / override dockers based on docker-compose from yml with specific domaine          
+              dockerme -c/-o domainename.tld yml --local  create / override dockers with local entry in /etc/host       
+              dockerme -rm domainename.tld                remove dockers, volumes, backup and configuration for specific domainename.tld          
+              dockerme -up/down domainename.tld           lunch docker-compose up/down -d for specific domainename.tld   
+              dockerme -start/stop domainename.tld        start/stop containers for specific domainename.tld                 
+              dockerme -log --view / --trancate           read docker log file / trancate docker log file
+              dockerme -auditor --dbfs                    Lunch Docker Brech For Security auditing tools          
+              dockerme -auditor --lynis                   Lunch Lynis auditing tools
+              dockerme -update                            Update dockerme without modifiyng runing containers
+
+
+EOF
+}
+DOCKERME_HEADER(){
+	cat << "EOF"
+
+	 ____                    __
+	/\  _`\                 /\ \                     /'\_/`\
+	\ \ \/\ \    ___     ___\ \ \/'\      __   _ __ /\      \     __
+	 \ \ \ \ \  / __`\  /'___\ \ , <    /'__`\/\`'__\ \ \__\ \  /'__`\
+	  \ \ \_\ \/\ \L\ \/\ \__/\ \ \\`\ /\  __/\ \ \/ \ \ \_/\ \/\  __/
+	   \ \____/\ \____/\ \____\\ \_\ \_\ \____\\ \_\  \ \_\\ \_\ \____\
+	    \/___/  \/___/  \/____/ \/_/\/_/\/____/ \/_/   \/_/ \/_/\/____/
+
+	
+	DockerME V0.5 (BETA) Feb 2019
+	Docker Hosting Tools
+	by Mind.Engineering
+	https://mind.engineering/
+	Works only on Ubuntu 16.04 LTS
+
+
+EOF
+}
+DOCKERME_GLOBAL_VARS(){
+	DOCKERME_DIR_PATH="/var/dockerme"
+	DOCKERME_HOME_PATH="/home/dockerme_home"
+	DOCKERME_CONFIG_PATH="$DOCKERME_DIR_PATH/dockerme.conf"
+	DOCKERME_YML_PATH="$DOCKERME_DIR_PATH/yml"
+	DOCKERME_LOG_PATH="/var/log/dockerme"
+	DOCKERME_CONTAINERS_CONF="$DOCKERME_DIR_PATH/containers.conf"
+	d=`date +"%Y-%m-%d %T"`
+	D=`date "+%Y%m%d%H%M%S"`	
+}
+DOCKERME_PROGRESS(){
+
+	function ceiling_divide {
+	  ((result=($1 + ($2 - 1))/$2))
+	  echo $result
+	}
+
+	function string_of_length {
+	  # Space-separate a sequene of N numbers and
+	  # replace each number with the wanted character
+	  seq $1 | tr '\n' ' ' | perl -pe "s/[0-9]+ /$2/g"
+	}
+
+	function move_up {
+	  # The escape sequence \033[<number>A moves the cursor <number> lines up
+	  # The carriage return '\r' moves the cursor to the start of the line
+	  echo -en "\033[${1}A\r"
+	}
+
+	function move_down {
+	  # The escape sequence \033[<number>B moves the cursor <number> lines down
+	  # and the carriage return '\r' moves the cursor to the far left again (communism)
+	  echo -en "\033[${1}B\r"
+	}
+
+	function print_progress {
+	  if [ $1 -gt $2 ]; then
+	    return 1
+	  fi
+
+	  # The indicator (current_steps/total_steps) width is two times the total
+	  # number, since ultimately we'll want to print "(total/total)", plus 3 for
+	  # the parantheses and forward slash
+	  indicator_width=$(echo $2 | awk '{ print length($1) * 2 + 3}')
+
+	  # printf allows us to right justify the text according to the maximum width
+	  indicator=$(printf "%${indicator_width}s" "($1/$2)")
+	  indicator="\033[${progress_indicator_format}m${indicator}\033[0m"
+
+	  percent=$(echo "(100.0 * $1) / $2" | bc)
+	  percent="\033[${progress_percent_format}m[${percent}%]\033[0m"
+
+	  # PROGRESS in bold (usually displayed as bright formats)
+	  echo -en "\033[1mPROGRESS\033[0m: $indicator $3 $percent"
+	}
+	if [ -z $PROGRESS_NUMBER_OF_STEPS ]; then
+	  echo -e "\033[31m[ERROR]\033[0m \$PROGRESS_NUMBER_OF_STEPS was not set!"
+	  exit -1
+	fi
+	progress_number_of_steps=$PROGRESS_NUMBER_OF_STEPS
+	progress_width=${PROGRESS_WIDTH:-$PROGRESS_NUMBER_OF_STEPS}
+	progress_indicator_format=${PROGRESS_INDICATOR_FORMAT:-31}
+	progress_percent_format=${PROGRESS_PERCENT_FORMAT:-35}
+	progress_symbol=${PROGRESS_SYMBOL:-'\xE2\x96\xAC'}
+	progress_symbol=$(echo -en "$progress_symbol")
+	progress_format=${PROGRESS_FORMAT:-32}
+	progress_fill_symbol=${PROGRESS_FILL_SYMBOL:-"$progress_symbol"}
+	progress_fill_format=${PROGRESS_FILL_FORMAT:-0}
+	progress_divisor=$(ceiling_divide $progress_number_of_steps $progress_width)
+	progress_step_size=$(ceiling_divide $progress_width $progress_number_of_steps)
+	progress_unit=$(string_of_length $progress_step_size "$progress_symbol")
+	progress_unit=$(echo -en "\033[${progress_format}m$progress_unit\033[${progress_fill_format}m")
+	progress_fill_unit=$(string_of_length $progress_step_size "$progress_fill_symbol")
+	progress_line=$(string_of_length $progress_width "$progress_fill_symbol")
+	progress_line="\033[${progress_fill_format}m${progress_line}\033[0m"
+	progress_step=0
+	progress_line_number=1
+	progress_max_lines=$(tput lines)
+	((progress_max_lines = progress_max_lines - 2))
+	function progress_step {
+
+	  # Don't overflow ...
+	  if [ -z $PROGRESS_STICKY ] && [ $progress_line_number -ge $progress_max_lines ]; then
+	    return 0
+	  elif [ $progress_step -gt $progress_number_of_steps ]; then
+	    return 0
+	  fi
+
+	  ((progress_step += 1))
+	  ((remainder=progress_step % progress_divisor))
+
+	  if [ $remainder -eq 0 ]; then
+	    # Replace one unit of the filler with one unit of progress
+	    progress_gsed_command="s/$progress_fill_unit/$progress_unit/"
+
+	    # If the fill symbol equals the progress symbol, we need to specify after
+	    # which match to start replacing, else we'll just match the first replacement
+	    # we made (since we'd be replacing e.g. xxxx with \033[31mx\033[0mxxx which
+	    # still contains x as the first text character, so next time we'd get
+	    # \033[31m\033[31mx\033[0m\033[0m instead of replacing the next fill character)
+	    if [ "$progress_fill_symbol" = "$progress_symbol" ]; then
+	        ((progress_index = progress_step / progress_divisor))
+	        progress_gsed_command="${progress_gsed_command}${progress_index}"
+	    fi
+	    progress_line="$(echo -e "$progress_line" | sed "$progress_gsed_command")"
+	  fi
+
+	  # We must always increment on the last step
+	  if [ $progress_step -eq $progress_number_of_steps ]; then
+	      ((progress_line_number += ${1:-1}))
+	  # Dont' increment when we've reached the end of the terminal
+	  elif [ $progress_line_number -lt $progress_max_lines ]; then
+	    # If nothing is passed, we increment by one (default), else if it is
+	    # -1, we do nothing (don't increment), else (if it's nonzero) we increment
+	    # by the given amount.
+	    if [ -z $1 ]; then
+	      ((progress_line_number += 1))
+	    elif [ $1 -ne -1 ]; then
+	      ((progress_line_number += $1))
+	    fi
+	  fi
+
+	  # Go back to the beginning of the line
+	  move_up $progress_line_number
+	  print_progress $progress_step $progress_number_of_steps "$progress_line"
+	  move_down $progress_line_number
+	}
+	function progress_end {
+	  if [ -z $PROGRESS_STICKY ] && [ $progress_line_number -ge $progress_max_lines ]; then
+	    return 0
+	  fi
+
+	  progress_line="$(echo -en "$progress_line" | perl -pe 's/$(echo $progress_fill_symbol)/'$progress_symbol'/g')"
+	  if [ $1 ]; then
+	    ((progress_line_number += $1))
+	  fi
+	  move_up $progress_line_number
+	  print_progress $progress_number_of_steps $progress_number_of_steps "$progress_line"
+	  move_down $progress_line_number
+	}
+	function progress_start {
+	  print_progress $progress_step $progress_number_of_steps "$progress_line"
+	  echo ""
+	}
+	if [ -z $PROGRESS_DEFER ]; then
+	  progress_start
+	fi 
+}
+DOCKERME_LOG_PATH_WRITE(){
+	COLOR_RED=`tput setaf 1`
+	COLOR_GREEN=`tput setaf 2`
+	COLOR_RESET=`tput sgr0`
+    # Get the number of columns, but subtact 8 to leave space for the status.
+    local COLUMNS=$((COLUMNS-118))
+    # Print left-aligned message and right-aligned status.
+    if [[ $STATUS -eq 1 ]]; then
+    	printf "%-*s [%s] \n" "$COLUMNS" " * $MESSAGES" "$COLOR_GREEN$STATUS_MSG$COLOR_RESET"
+    else
+    	printf "%-*s [%s] \n" "$COLUMNS" " * $MESSAGES" "$COLOR_RED$STATUS_MSG$COLOR_RESET"
+    fi   
+}
+DOCKERME_IF_DOCKERME_INSTALLED(){
+	if ! [[ $(which docker) && $(docker --version) ]]; then
+		MESSAGES="DOCKER NOT FOUND" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : DOCKER NOT FOUND" >> $DOCKERME_LOG_PATH.log
+		exit
+	fi	
+	if [[ ! -d $DOCKERME_DIR_PATH ]]; then
+		MESSAGES="DOCKERME REPOSITORY $DOCKERME_DIR_PATH NOT FOUND" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : DOCKERME REPOSITORY $DOCKERME_DIR_PATH NOT FOUND" >> $DOCKERME_LOG_PATH.log
+		exit
+    fi
+    if [[ ! -d $DOCKERME_YML_PATH ]]; then
+    	MESSAGES="DOCKERME YML REPOSITORY $DOCKERME_YML_PATH NOT FOUND" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+    	echo $d ": [FAIL] : DOCKERME YML REPOSITORY $DOCKERME_YML_PATH NOT FOUND" >> $DOCKERME_LOG_PATH.log
+		exit
+    fi
+    if [ ! -f $DOCKERME_CONFIG_PATH ]; then
+    	MESSAGES="DOCKERME CONFIGURATION FILE $DOCKERME_CONFIG_PATH NOT FOUND" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : DOCKERME CONFIGURATION FILE $DOCKERME_CONFIG_PATH NOT FOUND" >> $DOCKERME_LOG_PATH.log
+		exit
+    fi
+    . /$DOCKERME_CONFIG_PATH
+    if [ -z $HOME_PATH_DIRECTORY ]; then
+    	MESSAGES="HOME_PATH_DIRECTORY IN DOCKERME CONFIGURATION FILE $DOCKERME_CONFIG_PATH IS EMPTY" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : HOME_PATH_DIRECTORY IN DOCKERME CONFIGURATION FILE $DOCKERME_CONFIG_PATH IS EMPTY" >> $DOCKERME_LOG_PATH.log
+		exit
+    fi 
+}
+DOCKERME_UNINSTALL(){
+	PROGRESS_STICKY=yes
+	PROGRESS_WIDTH=100
+	progress_max_lines=1
+	PROGRESS_NUMBER_OF_STEPS=${1:-12}
+	DOCKERME_PROGRESS
+	for i in $(seq $PROGRESS_NUMBER_OF_STEPS); do
+		if [[ $i -eq 1 ]]; then
+			if ! [[ $(which docker) && $(docker --version) ]]; then
+				MESSAGES="DOCKER NOT FOUND" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : DOCKER NOT FOUND : CODE UNI1 " >> $DOCKERME_LOG_PATH.log
+				#exit
+			else
+				MESSAGES="DOCKERME UNINSTALL" STATUS=1 STATUS_MSG="INITIALIZING" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [INITIALIZING] : DOCKERME UNINSTALL" >> $DOCKERME_LOG_PATH.log
+			fi
+		elif [[ $i -eq 2 ]]; then
+			sudo docker kill $(docker ps -q)  1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="DOCKER KILL ALL CONTAINER" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : DOCKER KILL ALL CONTAINER" >> $DOCKERME_LOG_PATH.log
+			fi
+		elif [[ $i -eq 3 ]]; then
+			sudo docker rm $(docker ps -a -q)  1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="DOCKER REMOVE ALL CONTAINER" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : DOCKER REMOVE ALL CONTAINER" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="DOCKER REMOVING ALL CONTAINER." STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : DOCKER REMOVING ALL CONTAINER : CODE UNI3 " >> $DOCKERME_LOG_PATH.log
+				#exit
+			fi
+		elif [[ $i -eq 4 ]]; then
+			sudo docker rmi $(docker images -q) 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="DOCKER REMOVE ALL CONTAINER IMAGES" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : DOCKER REMOVE ALL CONTAINER IMAGES" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="DOCKER REMOVING ALL CONTAINER IMAGES" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : DOCKER REMOVING ALL CONTAINER IMAGES: CODE UNI4 " >> $DOCKERME_LOG_PATH.log
+				#exit
+			fi
+		elif [[ $i -eq 5 ]]; then
+			sudo apt-get purge -y docker-ce 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="DOCKER PURGE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : DOCKER PURGE" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="DOCKER PURGING" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : DOCKER PURGING : CODE UNI5 " >> $DOCKERME_LOG_PATH.log
+				#exit
+			fi
+		elif [[ $i -eq 6 ]]; then
+			sudo rm -rf /var/lib/docker /etc/docker /etc/systemd/system/docker.service /etc/init/d/docker /usr/local/bin/docker-compose $DOCKERME_DIR_PATH $HOME_PATH_DIRECTORY 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="REMOVE EXTRA CONFIG FILE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : OCKER REMOVE EXTRA CONFIG FILE" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="REMOVING EXTRA CONFIG FILE" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : DOCKER REMOVING EXTRA CONFIG FILE : CODE UNI6 " >> $DOCKERME_LOG_PATH.log
+				#exit
+			fi
+		elif [[ $i -eq 7 ]]; then
+			sudo apt-get autoremove --purge -y docker-ce 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="DOCKER REMOVE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : DOCKER REMOVE" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="DOCKER REMOVING" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : DOCKER REMOVING : CODE UNI7 " >> $DOCKERME_LOG_PATH.log
+				#exit
+			fi
+		elif [[ $i -eq 8 ]]; then
+			sudo apt-get autoclean 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="AUTOREMOVE AUTOCLEAN" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : DOCKER AUTOREMOVE AUTOCLEAN" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="AUTOREMOVING AUTOCLEANING" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : DOCKER AUTOREMOVING AUTOCLEANING : CODE UNI8 " >> $DOCKERME_LOG_PATH.log
+				#exit
+			fi
+		elif [[ $i -eq 9 ]]; then
+			crontab -u root -l | grep -v 'dockerme'  | crontab -u root - 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="DELEATE SCHEDULED BACKUP FROM CRONTAB" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : DELEATE SCHEDULED BACKUP FROM CRONTAB" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="DELEATING SCHEDULED BACKUP FROM CRONTAB" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : DELEATING SCHEDULED BACKUP FROM CRONTAB : CODE UNI9 " >> $DOCKERME_LOG_PATH.log
+				#exit
+			fi
+		elif [[ $i -eq 10 ]]; then
+			sudo rm -r  $DOCKERME_HOME_PATH 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="DELEATE DOCKERME_HOME_PATH $DOCKERME_HOME_PATH" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : DELEATE DOCKERME_HOME_PATH $DOCKERME_HOME_PATH" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="DELEATING DOCKERME_HOME_PATH $DOCKERME_HOME_PATH" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : DELEATING DOCKERME_HOME_PATH $DOCKERME_HOME_PATH : CODE UNI10 " >> $DOCKERME_LOG_PATH.log
+				#exit
+			fi
+		elif [[ $i -eq 11 ]]; then
+			rm /usr/bin/dockerme 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="DELEATE DOCKERME FROM /usr/bin" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : DELEATE DOCKERME FROM /usr/bin" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="DELEATING DOCKERME FROM /usr/bin" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : DOCKERME FROM /usr/bin" >> $DOCKERME_LOG_PATH.log
+				#exit
+			fi
+		elif [[ $i -eq 12 ]]; then
+			MESSAGES="DOCKERME UNINSTALL" STATUS=1 STATUS_MSG="COMPLETED" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [COMPLETED] : DOCKERME UNINSTALL" >> $DOCKERME_LOG_PATH.log
+		fi
+	  progress_step
+	done 
+}
+DOCKERME_INSTALL(){
+	PROGRESS_STICKY=yes
+	PROGRESS_WIDTH=100
+	progress_max_lines=1
+	PROGRESS_NUMBER_OF_STEPS=${1:-21}
+	DOCKERME_PROGRESS
+	for i in $(seq $PROGRESS_NUMBER_OF_STEPS); do
+		if [[ $i -eq 1 ]]; then
+			OS_RELEASE=$(lsb_release -r | awk -F"\t" '{print $2}';)
+			if [[ "$OS_RELEASE" == "16.04" ]]; then
+				if  [[ $(which docker) && $(docker --version) ]]; then
+					MESSAGES="DOCKER FOUND" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [FAIL] : DOCKER FOUND : CODE UNI1 " >> $DOCKERME_LOG_PATH.log
+					exit
+				else
+					MESSAGES="DOCKERME SETUP" STATUS=1 STATUS_MSG="INITIALIZING" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [INITIALIZING] : DOCKERME UNINSTALL" >> $DOCKERME_LOG_PATH.log
+				fi
+			else
+				MESSAGES="DOCKERME SETUP" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : DOCKERME ONLY COMPATIBLE WITH Ubuntu 16.04.4 LTS" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 2 ]]; then
+			apt-get update -y 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="SYSTEM UPDATE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : SYSTEM UPDATE" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="SYSTEM UPDATING" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : SYSTEM UPDATING : CODE I2 " >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 3 ]]; then
+			apt-get upgrade -y 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="SYSTEM UPGRADE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : SYSTEM UPGRADE" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="SYSTEM UPGRADING" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : SYSTEM UPGRADING : CODE I3 " >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 4 ]]; then
+			apt-get install git zip unzip -y 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="INSTALL git, zip & unzip" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : INSTALL git, zip & unzip" >> $DOCKERME_LOG_PATH.log
+				#exit
+			else
+				MESSAGES="INSTALLING git, zip & unzip" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : INSTALLING git, zip & unzip : CODE I4 " >> $DOCKERME_LOG_PATH.log
+				#exit
+			fi
+		elif [[ $i -eq 5 ]]; then
+			apt-get install -y apt-transport-https ca-certificates curl software-properties-common 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="INSTALL PACKAGE apt-transport-https, ca-certificates, curl, software-properties-common" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : INSTALL PACKAGE apt-transport-https, ca-certificates, curl, software-properties-common" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="INSTALLING PACKAGE apt-transport-https, ca-certificates, curl, software-properties-common" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : INSTALLING PACKAGE apt-transport-https, ca-certificates, curl, software-properties-common : CODE I5 " >> $DOCKERME_LOG_PATH.log
+				#exit
+			fi
+		elif [[ $i -eq 6 ]]; then
+			curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -  1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="DOWNLOAD DOCKER GNU PRIVACY GUARD (GPG)" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : DOWNLOAD DOCKER GNU PRIVACY GUARD (GPG)" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="DOWNLOADING DOCKER GNU PRIVACY GUARD (GPG)" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : DOWNLOADING DOCKER GNU PRIVACY GUARD (GPG)" >> $DOCKERME_LOG_PATH.log
+				#exit
+			fi
+		elif [[ $i -eq 7 ]]; then
+			add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"  1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="ADD DOCKER REPOSITORY" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : ADD DOCKER REPOSITORY" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="ADDING DOCKER REPOSITORY" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : ADDING DOCKER REPOSITORY : CODE I7 " >> $DOCKERME_LOG_PATH.log
+				#exit
+			fi		
+		elif [[ $i -eq 8 ]]; then
+			apt-get update -y 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="SYSTEM UPDATE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : SYSTEM UPDATE" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="SYSTEM UPDATING" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : SYSTEM UPDATING : CODE I8 " >> $DOCKERME_LOG_PATH.log
+				#exit
+			fi
+		elif [[ $i -eq 9 ]]; then
+			apt-get install -y docker-ce -y 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="INSTALL DOCKER-CE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : INSTALL DOCKER-CE" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="INSTALLING DOCKER-CE" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : INSTALLING DOCKER-CE : CODE I9 " >> $DOCKERME_LOG_PATH.log
+				#exit
+			fi
+		elif [[ $i -eq 10 ]]; then
+			#apt-cache madison docker-ce
+			#usermod -aG docker ${USER}
+			curl -L https://github.com/docker/compose/releases/download/1.21.0-rc1/docker-compose-`uname -s`-`uname -m` -o /usr/local/bin/docker-compose 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="DOWNLOAD DOCKER-COMPOSE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : DOWNLOAD DOCKER-COMPOSE" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="DOWNLOAD DOCKER-COMPOSE" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : DOWNLOAD DOCKER-COMPOSE : CODE INS10 " >> $DOCKERME_LOG_PATH.log
+				#exit
+			fi
+		elif [[ $i -eq 11 ]]; then
+			chmod +x /usr/local/bin/docker-compose 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="ADD EXECUTE PERMESSION TO DOCKER-COMPOSE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : ADD EXECUTE PERMESSION TO DOCKER-COMPOSE" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="ADDING EXECUTE PERMESSION TO DOCKER-COMPOSE" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : ADDING EXECUTE PERMESSION TO DOCKER-COMPOSE : CODE INS11 " >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 12 ]]; then
+			chmod +x $PWD/dockerme 
+			cp $PWD/dockerme /usr/bin/dockerme
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="COPYING DOCKERME UNDER /usr/bin" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : COPYING DOCKERME UNDER /usr/bin" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="COPYING DOCKERME UNDER /usr/bin" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : COPYING DOCKERME UNDER /usr/bin" >> $DOCKERME_LOG_PATH.log
+			fi
+		elif [[ $i -eq 13 ]]; then
+			if [[ ! -d $DOCKERME_DIR_PATH ]]; then
+				mkdir $DOCKERME_DIR_PATH 1>/dev/null 2>&1;
+				if [[ $? -eq 0 ]]; then
+					MESSAGES="CREATE DOCKERME DIRECTORY UNDER $DOCKERME_DIR_PATH" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : CREATE DOCKERME DIRECTORY UNDER $DOCKERME_DIR_PATH" >> $DOCKERME_LOG_PATH.log
+				else
+					MESSAGES="CREATING DOCKERME DIRECTORY UNDER $DOCKERME_DIR_PATH" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : CREATING DOCKERME DIRECTORY UNDER $DOCKERME_DIR_PATH : CODE INS12 " >> $DOCKERME_LOG_PATH.log
+	                exit
+	            fi
+	        else
+	        	MESSAGES="TRYING TO CREATE $DOCKERME_DIR_PATH, BUT DIRECTORY ALRADY EXIST!" STATUS=1 STATUS_MSG="WARNING" DOCKERME_LOG_PATH_WRITE
+	        	echo $d ": [WARNING] : TRYING TO CREATE $DOCKERME_DIR_PATH, BUT DIRECTORY ALRADY EXIST!" >> $DOCKERME_LOG_PATH.log
+	        fi
+	    elif [[ $i -eq 14 ]]; then
+			touch $DOCKERME_CONFIG_PATH  1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="CREATE CONFIGURATION FILE UNDER $DOCKERME_DIR_PATH" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : CREATE CONFIGURATION FILE UNDER $DOCKERME_DIR_PATH" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="CREATING CONFIGURATION FILE UNDER $DOCKERME_DIR_PATH" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : CREATING CONFIGURATION FILE UNDER $DOCKERME_DIR_PATH : CODE INS14 " >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 15 ]]; then
+			mkdir -p $DOCKERME_HOME_PATH 1>/dev/null 2>&1;
+			echo "HOME_PATH_DIRECTORY=$DOCKERME_HOME_PATH" >> $DOCKERME_DIR_PATH/dockerme.conf
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="SETUP HOME HOME_PATH_DIRECTORY UNDER $DOCKERME_HOME_PATH" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : SETUP HOME HOME_PATH_DIRECTORY UNDER $DOCKERME_HOME_PATH" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="SETING UP HOME HOME_PATH_DIRECTORY UNDER $DOCKERME_HOME_PATH" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : SETING UP HOME HOME_PATH_DIRECTORY UNDER $DOCKERME_HOME_PATH : CODE INS15 " >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 16 ]]; then
+			if [[ ! -d $DOCKERME_DIR_PATH/yml ]]; then
+				cp -r $PWD/yml $DOCKERME_DIR_PATH/yml
+				if [[ $? -eq 0 ]]; then
+					MESSAGES="COPYING YML LIBRARY INTO $DOCKERME_DIR_PATH" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : COPYING YML LIBRARY INTO $DOCKERME_DIR_PATH" >> $DOCKERME_LOG_PATH.log
+				else
+					MESSAGES="COPYING YML LIBRARY INTO $DOCKERME_DIR_PATH" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : COPYING YML LIBRARY INTO $DOCKERME_DIR_PATH" >> $DOCKERME_LOG_PATH.log
+	                exit
+	            fi
+	        else
+	        	MESSAGES="COPYING YML LIBRARY INTO $DOCKERME_DIR_PATH" STATUS=1 STATUS_MSG="WARNING" DOCKERME_LOG_PATH_WRITE
+	        	echo $d ": [WARNING] : COPYING YML LIBRARY INTO $DOCKERME_DIR_PATH" >> $DOCKERME_LOG_PATH.log
+	        fi
+        elif [[ $i -eq 17 ]]; then
+			if [[ ! -d $DOCKERME_DIR_PATH/nginx-ssl-container ]]; then
+				cp -r $PWD/nginx-ssl-container $DOCKERME_DIR_PATH/nginx-ssl-container
+				if [[ $? -eq 0 ]]; then
+					mkdir -p $DOCKERME_DIR_PATH/nginx-ssl-container/certs
+					chmod -R 777 $DOCKERME_DIR_PATH/nginx-ssl-container/certs
+					MESSAGES="COPYING NGINX-SSL-CONTAINERS" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : COPYING NGINX-SSL-CONTAINERS" >> $DOCKERME_LOG_PATH.log
+				else
+					MESSAGES="COPYING NGINX-SSL-CONTAINERS" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : COPYING NGINX-SSL-CONTAINERS " >> $DOCKERME_LOG_PATH.log
+	                exit
+	            fi
+	        else
+	        	MESSAGES="TRYING TO COPY NGINX-SSL-CONTAINERS BUT DIRECTORY ALRADY EXIST!" STATUS=1 STATUS_MSG="WARNING" DOCKERME_LOG_PATH_WRITE
+	        	echo $d ": [WARNING] : RYING TO COPY NGINX-SSL-CONTAINERS BUT DIRECTORY ALRADY EXIST!" >> $DOCKERME_LOG_PATH.log
+	        fi
+		elif [[ $i -eq 18 ]]; then
+			cd $DOCKERME_DIR_PATH/nginx-ssl-container
+			sudo sed -i -e 's|$path|'$PWD'|g' docker-compose.yml 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="COMPOSE docker-compose.yml for NGINX-SSL-CONTAINERS" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : COMPOSE docker-compose.yml for NGINX-SSL-CONTAINERS" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="COMPOSE docker-compose.yml for NGINX-SSL-CONTAINERS" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : COMPOSE docker-compose.yml for NGINX-SSL-CONTAINERS" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 19 ]]; then
+			cd $DOCKERME_DIR_PATH/nginx-ssl-container
+			docker-compose up -d 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="UPPING NGINX-SSL-CONTAINERS" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : UPPING NGINX-SSL-CONTAINERS" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="UPPING NGINX-SSL-CONTAINERS" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : UPPING NGINX-SSL-CONTAINERS" >> $DOCKERME_LOG_PATH.log
+			fi
+		elif [[ $i -eq 20 ]]; then
+			cd $DOCKERME_DIR_PATH
+			git clone https://github.com/CISOfy/lynis.git 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="CLONE LYNIS SECURITY AUDITING AND HARDENING TOOLS" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : CLONE LYNIS SECURITY AUDITING AND HARDENING TOOL" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="CLONE LYNIS SECURITY AUDITING AND HARDENING TOOL" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : CLONE LYNIS SECURITY AUDITING AND HARDENING TOOL " >> $DOCKERME_LOG_PATH.log
+			fi
+		elif [[ $i -eq 21 ]]; then
+			MESSAGES="DOCKERME SETUP" STATUS=1 STATUS_MSG="COMPLETED" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [OK] : DOCKERME SETUP" >> $DOCKERME_LOG_PATH.log
+		fi
+	  progress_step
+	done 
+}
+DOCKERME_LOG_PATH_VIEW(){
+	DOCKERME_IF_DOCKERME_INSTALLED
+	tail -f $DOCKERME_LOG_PATH.log
+	if [[ ! $? -eq 0 ]]; then
+		MESSAGES="WIEW LOG" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : VIEWING LOG : CODE VL01" >> $DOCKERME_LOG_PATH.log	
+	fi	
+}
+DOCKERME_LOG_PATH_TRUNCATE(){
+	DOCKERME_IF_DOCKERME_INSTALLED
+	truncate -s 0 $DOCKERME_LOG_PATH.log
+	if [[ ! $? -eq 0 ]]; then
+		MESSAGES="TRUNCATE LOG" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : TRUNCATING LOG : CODE VT01" >> $DOCKERME_LOG_PATH.log	
+	fi	
+}
+DOCKERME_YML_LIST(){
+	DOCKERME_IF_DOCKERME_INSTALLED
+	ls -1 $DOCKERME_YML_PATH 1>/dev/null 2>&1;
+	if [ $? -eq 0 ]; then
+		MESSAGES="DOCKERME YML LIST" STATUS=1 STATUS_MSG="INITIALIZING" DOCKERME_LOG_PATH_WRITE
+		echo ""
+		ls -1 $DOCKERME_YML_PATH
+		echo ""
+		MESSAGES="DOCKERME YML LIST" STATUS=1 STATUS_MSG="COMPLETED" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [OK] : DOCKERME YML LIST" >> $DOCKERME_LOG_PATH.log
+	else
+		MESSAGES="DOCKERME YML LIST" STATUS=1 STATUS_MSG="INITIALIZING" DOCKERME_LOG_PATH_WRITE
+		MESSAGES="DOCKERME YML LIST" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : DOCKERME YML LIST : CODE YUL01" >> $DOCKERME_LOG_PATH.log
+		exit
+	fi
+}
+DOCKERME_IF_WEBSITE_DIRECTORY_EXIST(){
+	DOCKERME_IF_DOCKERME_INSTALLED
+	. /$DOCKERME_CONFIG_PATH
+	if [ -d $HOME_PATH_DIRECTORY/$DOMAINE_NAME ]; then
+		MESSAGES="DOMAINE NAME $DOMAINE_NAME ALRADY HOSTED BY DOCKERME" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : DOMAINE NAME $DOMAINE_NAME ALRADY HOSTED BY DOCKERME " >> $DOCKERME_LOG_PATH.log
+		exit
+	fi
+}
+DOCKERME_IF_WEBSITE_DIRECTORY_NOT_EXIST(){
+	DOCKERME_IF_DOCKERME_INSTALLED
+	. /$DOCKERME_CONFIG_PATH
+	if [ ! -d $HOME_PATH_DIRECTORY/$DOMAINE_NAME ]; then
+		MESSAGES="DOMAINE NAME $DOMAINE_NAME NOT FOUND" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : DOMAINE NAME $DOMAINE_NAME NOT FOUND " >> $DOCKERME_LOG_PATH.log
+		exit
+	fi
+}
+DOCKERME_IF_YML_EXIST(){
+	DOCKERME_IF_DOCKERME_INSTALLED
+	if [ ! -f $DOCKERME_YML_PATH/$1 ]; then
+		MESSAGES="YML FILE $1 NOT FOUND" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : YML FILE $1 NOT FOUND" >> $DOCKERME_LOG_PATH.log
+		exit
+	fi
+}
+DOCKERME_IF_NGINX-SSL-CONTAINERS_EXIST(){
+	DOCKERME_IF_DOCKERME_INSTALLED 
+	if [[ ! "$(docker ps -a | grep nginx)" ]]; then
+		MESSAGES="NGIX CONTAINER NOT FOUND" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : NGINX CONTAINER NOT FOUND" >> $DOCKERME_LOG_PATH.log
+		exit
+	fi 
+	if [[ ! "$(docker ps -a | grep nginx-gen)" ]]; then
+		MESSAGES="NGIX-GEN CONTAINER NOT FOUND" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : NGINX-GEN CONTAINER NOT FOUND" >> $DOCKERME_LOG_PATH.log
+		exit
+	fi
+	if [[ ! "$(docker ps -a | grep nginx-letsencrypt)" ]]; then
+		MESSAGES="NGIX-LETSENCRYPT CONTAINER NOT FOUND" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : NGINX-LESTENCRYPT CONTAINER NOT FOUND" >> $DOCKERME_LOG_PATH.log
+		exit
+	fi
+}
+DOCKERME_CONTAINERS_DOWN(){
+	DOMAINE_NAME=$DOMAINE_NAME DOCKERME_IF_WEBSITE_DIRECTORY_NOT_EXIST
+	. /$DOCKERME_CONFIG_PATH
+	cd $HOME_PATH_DIRECTORY/$DOMAINE_NAME 1>/dev/null 2>&1;
+	docker-compose down 1>/dev/null 2>&1;
+	if [[ $? -eq 0 ]]; then
+		MESSAGES="DOWN CONTAINERS FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [OK] : STOP CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+	else
+		MESSAGES="DOWNING CONTAINERS" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : DOWNING CONTAINERS FORM $DOMAINE_NAME : CODE CSTO01" >> $DOCKERME_LOG_PATH.log
+	fi
+}
+DOCKERME_CONTAINERS_UP(){
+	DOMAINE_NAME=$DOMAINE_NAME DOCKERME_IF_WEBSITE_DIRECTORY_NOT_EXIST
+	. /$DOCKERME_CONFIG_PATH
+	cd $HOME_PATH_DIRECTORY/$DOMAINE_NAME 1>/dev/null 2>&1;
+	docker-compose up -d 1>/dev/null 2>&1;
+	if [[ $? -eq 0 ]]; then
+		MESSAGES="UP CONTAINERS FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [OK] : UPING CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+	else
+		MESSAGES="UPING CONTAINERS FOR $DOMAINE_NAME" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : UPING CONTAINERS FOR $DOMAINE_NAME : CODE CSTA01" >> $DOCKERME_LOG_PATH.log
+	fi
+}
+DOCKERME_CONTAINERS_CREATE(){
+	PROGRESS_STICKY=yes
+	PROGRESS_WIDTH=100
+	PROGRESS_NUMBER_OF_STEPS=${1:-11}
+	progress_line_number=1
+	DOCKERME_PROGRESS
+	for i in $(seq $PROGRESS_NUMBER_OF_STEPS); do
+		if [[ $i -eq 1 ]]; then
+			MESSAGES="CREATE CONTAINERS" STATUS=1 STATUS_MSG="INITIALIZING" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [INITIALIZING] : CREATING CONTAINERS" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 2 ]]; then
+			DOCKERME_IF_NGINX-SSL-CONTAINERS_EXIST
+			MESSAGES="CHECK NGINX-PROXY" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [OK] : CHEKING NGINX-PROXY CONTAINER" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 3 ]]; then
+			DOCKERME_IF_YML_EXIST $YML
+			MESSAGES="CHECK YML FILE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [OK] : CHEKING YML FILE $DOCKERME_YML_PATH/$YML" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 4 ]]; then
+			DOMAINE_NAME=$DOMAINE_NAME DOCKERME_IF_WEBSITE_DIRECTORY_EXIST
+			MESSAGES="CHECK IF DOMAINE NAME NOT USED" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [OK] : CHEKING IF DOMAINE NAME $DOMAINE_NAME NOT USED" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 5 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			mkdir $HOME_PATH_DIRECTORY/$DOMAINE_NAME 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="CREATE HOME DIRECTORY" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : CREATING HOME DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="CREATING HOME DIRECTORY" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : CREATING HOME DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME : CODE CC05" >> $DOCKERME_LOG_PATH.log
+			fi
+		elif [[ $i -eq 6 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			touch $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="CREATE DOCKER-COMPOSE.YML AS EMPTY FILE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : CREATING EMPTYFILE $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="CREATE DOCKER-COMPOSE.YML AS EMPTY FILE" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : CREATING EMPTYFILE $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC06" >> $DOCKERME_LOG_PATH.log
+			fi
+		elif [[ $i -eq 7 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			cat $DOCKERME_YML_PATH/$YML > $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="COPY YML FILE IN docker-compose.yml" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : COPYING $YML INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="COPYING YML FILE IN docker-compose.yml" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : COPYING $YML INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC07" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 8 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			cd $HOME_PATH_DIRECTORY/$DOMAINE_NAME
+			sudo sed -i -e  's/$host/'$DOMAINE_NAME'/g' docker-compose.yml 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				sudo sed -i -e 's|$path|'$HOME_PATH_DIRECTORY'|g' docker-compose.yml 1>/dev/null 2>&1;
+				if [[ $? -eq 0 ]]; then
+					MESSAGES="COMPOSE docker-compose.yml" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [OK] : COMPOSE $YML INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml" >> $DOCKERME_LOG_PATH.log
+				else
+					MESSAGES="COMPOSING YML FILE" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [FAIL] : COMPOSING YML FILE INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC08" >> $DOCKERME_LOG_PATH.log
+					exit
+				fi
+			else
+				echo " * COMPOSING YML FILE\t: [FAIL]"
+				echo $d ": [FAIL] : COMPOSING YML FILE INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC08+" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 9 ]]; then
+			YML="$YML" DOCKERME_CREATE_CONTAINERS_SPECIAL_CONFIG
+		elif [[ $i -eq 10 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			cd $HOME_PATH_DIRECTORY/$DOMAINE_NAME
+			docker-compose up -d 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="START CONTAINERS FROM LOCAL DOCKER-COMPOSE.YML" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : STARTING CONTAINERS FROM $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="STARTING CONTAINERS FROM LOCAL DOCKER-COMPOSE.YML" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : STARTING CONTAINERS FROM $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC09" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 11 ]]; then
+			MESSAGES="CREATE CONTAINERS" STATUS=1 STATUS_MSG="COMPLETED" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [COMPLETED] : CREATE CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+		fi
+		progress_step
+	done
+}
+DOCKERME_WRITE_LOCAL_ENTRY_ETC_HOST(){
+	if [[ "$YML" == "wp_php7" ]]; then
+		echo "#START ENTRY FOR $DOMAINE_NAME HOSTED BY DOCKERME" >> /etc/hosts
+		echo "127.0.0.1   $DOMAINE_NAME" >> /etc/hosts
+		echo "127.0.0.1   www.$DOMAINE_NAME" >> /etc/hosts
+		echo "127.0.0.1   phpmyadmin.$DOMAINE_NAME" >> /etc/hosts
+		echo "#END ENTRY FOR $DOMAINE_NAME HOSTED BY DOCKERME" >> /etc/hosts
+	else
+		echo "#START ENTRY FOR $DOMAINE_NAME HOSTED BY DOCKERME" >> /etc/hosts
+		echo "127.0.0.1   $DOMAINE_NAME" >> /etc/hosts
+		echo "127.0.0.1   www.$DOMAINE_NAME" >> /etc/hosts
+		echo "#END ENTRY FOR $DOMAINE_NAME HOSTED BY DOCKERME" >> /etc/hosts
+	fi
+}
+DOCKERME_CONTAINERS_CREATE_LOCAL(){
+	PROGRESS_STICKY=yes
+	PROGRESS_WIDTH=100
+	PROGRESS_NUMBER_OF_STEPS=${1:-12}
+	progress_line_number=1
+	DOCKERME_PROGRESS
+	for i in $(seq $PROGRESS_NUMBER_OF_STEPS); do
+		if [[ $i -eq 1 ]]; then
+			MESSAGES="CREATE CONTAINERS" STATUS=1 STATUS_MSG="INITIALIZING" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [INITIALIZING] : CREATING CONTAINERS" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 2 ]]; then
+			DOCKERME_IF_NGINX-SSL-CONTAINERS_EXIST
+			MESSAGES="CHECK NGINX-PROXY" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [OK] : CHEKING NGINX-PROXY CONTAINER" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 3 ]]; then
+			DOCKERME_IF_YML_EXIST $YML
+			MESSAGES="CHECK YML FILE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [OK] : CHEKING YML FILE $DOCKERME_YML_PATH/$YML" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 4 ]]; then
+			DOMAINE_NAME=$DOMAINE_NAME DOCKERME_IF_WEBSITE_DIRECTORY_EXIST
+			MESSAGES="CHECK IF DOMAINE NAME NOT USED" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [OK] : CHEKING IF DOMAINE NAME $DOMAINE_NAME NOT USED" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 5 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			mkdir $HOME_PATH_DIRECTORY/$DOMAINE_NAME 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="CREATE HOME DIRECTORY" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : CREATING HOME DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="CREATING HOME DIRECTORY" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : CREATING HOME DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME : CODE CC05" >> $DOCKERME_LOG_PATH.log
+			fi
+		elif [[ $i -eq 6 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			touch $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="CREATE DOCKER-COMPOSE.YML AS EMPTY FILE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : CREATING EMPTYFILE $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="CREATE DOCKER-COMPOSE.YML AS EMPTY FILE" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : CREATING EMPTYFILE $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC06" >> $DOCKERME_LOG_PATH.log
+			fi
+		elif [[ $i -eq 7 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			cat $DOCKERME_YML_PATH/$YML > $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="COPY YML FILE IN docker-compose.yml" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : COPYING $YML INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="COPYING YML FILE IN docker-compose.yml" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : COPYING $YML INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC07" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 8 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			cd $HOME_PATH_DIRECTORY/$DOMAINE_NAME
+			sudo sed -i -e  's/$host/'$DOMAINE_NAME'/g' docker-compose.yml 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				sudo sed -i -e 's|$path|'$HOME_PATH_DIRECTORY'|g' docker-compose.yml 1>/dev/null 2>&1;
+				if [[ $? -eq 0 ]]; then
+					MESSAGES="COMPOSE docker-compose.yml" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [OK] : COMPOSE $YML INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml" >> $DOCKERME_LOG_PATH.log
+				else
+					MESSAGES="COMPOSING YML FILE" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [FAIL] : COMPOSING YML FILE INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC08" >> $DOCKERME_LOG_PATH.log
+					exit
+				fi
+
+			else
+				echo " * COMPOSING YML FILE\t: [FAIL]"
+				echo $d ": [FAIL] : COMPOSING YML FILE INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC08+" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 9 ]]; then
+			YML="$YML" DOCKERME_CREATE_CONTAINERS_SPECIAL_CONFIG
+		elif [[ $i -eq 10 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			cd $HOME_PATH_DIRECTORY/$DOMAINE_NAME
+			docker-compose up -d 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="START CONTAINERS FROM LOCAL DOCKER-COMPOSE.YML" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : STARTING CONTAINERS FROM $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="STARTING CONTAINERS FROM LOCAL DOCKER-COMPOSE.YML" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : STARTING CONTAINERS FROM $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC09" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 11 ]]; then
+			DOMAINE_NAME=$DOMAINE_NAME YML=$YML DOCKERME_WRITE_LOCAL_ENTRY_ETC_HOST
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="ADD LOCAL ENTRY IN /etc/host FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : ADDING LOCAL ENTRY IN /etc/host FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="ADDING LOCAL ENTRY IN /etc/host FOR $DOMAINE_NAME" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : ADDING LOCAL ENTRY IN /etc/host FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 12 ]]; then
+			MESSAGES="CREATE CONTAINERS" STATUS=1 STATUS_MSG="COMPLETED" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [COMPLETED] : CREATE CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+		fi
+		progress_step
+	done
+}
+DOCKERME_CONTAINERS_REMOVE(){
+	PROGRESS_STICKY=yes
+	PROGRESS_WIDTH=100
+	PROGRESS_NUMBER_OF_STEPS=${1:-6}
+	progress_line_number=1
+	DOCKERME_PROGRESS
+	for i in $(seq $PROGRESS_NUMBER_OF_STEPS); do
+		if [[ $i -eq 1 ]]; then
+			MESSAGES="REMOVE CONTAINERS" STATUS=1 STATUS_MSG="INITIALIZING" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [INITIALIZING] : REMOVING CONTAINERS" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 2 ]]; then
+			DOCKERME_IF_NGINX-SSL-CONTAINERS_EXIST
+			MESSAGES="CHECK NGINX-PROXY CONTAINER" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [OK] : CHEKING NGINX-PROXY CONTAINER" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 3 ]]; then
+			DOMAINE_NAME=$DOMAINE_NAME DOCKERME_CONTAINERS_DOWN
+		elif [[ $i -eq 4 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			sudo rm -r $HOME_PATH_DIRECTORY/$DOMAINE_NAME
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="DELETE HOME DIRECTORY" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : DELETING HOME DIRECTORY FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="DELETING HOME DIRECTORY" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : DELETING HOME DIRECTORY FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 5 ]]; then
+			sudo sed -i "/$DOMAINE_NAME/ d" /etc/hosts
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="REMOVE LOCL ENTRY FROM /ect/host" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : REMOVING LOCL ENTRY FROM /ect/host" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="REMOVING LOCL ENTRY FROM /ect/host" STATUS=1 STATUS_MSG="WARNINIG" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [WARNINIG] : REMOVING LOCL ENTRY FROM /ect/host" >> $DOCKERME_LOG_PATH.log
+			fi
+		elif [[ $i -eq 6 ]]; then
+			MESSAGES="REMOVE CONTAINERS" STATUS=1 STATUS_MSG="COMPLETED" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [COMPLETED] : REMOVING CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+		fi
+		progress_step
+	done
+}
+DOCKERME_CONTAINERS_BACKUP(){
+	PROGRESS_STICKY=yes
+	PROGRESS_WIDTH=100
+	progress_max_lines=1
+	PROGRESS_NUMBER_OF_STEPS=${1:-8}
+	DOCKERME_PROGRESS
+	for i in $(seq $PROGRESS_NUMBER_OF_STEPS); do
+		if [[ $i -eq 1 ]]; then
+			MESSAGES="BACKUP $DOMAINE_NAME" STATUS=1 STATUS_MSG="INITIALIZING" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [INITIALIZING] : DOCKERME UNINSTALL" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 2 ]]; then
+			DOCKERME_IF_WEBSITE_DIRECTORY_NOT_EXIST
+			MESSAGES="CHECK DOMAINE_NAME=$DOMAINE_NAME" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+		elif [[ $i -eq 3 ]]; then
+			DOMAINE_NAME=$DOMAINE_NAME DOCKERME_CONTAINERS_DOWN
+		elif [[ $i -eq 4 ]]; then
+			cd $HOME_PATH_DIRECTORY/$DOMAINE_NAME
+			tar --exclude='backups' -cf $D.tar * 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="CREATE ARCHIVE FILE $D.zip" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : CREATE ARCHIVE FILE $D.tar" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="CREATING ARCHIVE FILE $D.zip" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : CREATING ARCHIVE FILE $D.tar" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 5 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			if [ -d $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup ]; then
+				MESSAGES="CHECK BACKUP DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : CHECK BACKUP DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup " >> $DOCKERME_LOG_PATH.log
+			else
+				mkdir $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup
+				if [[ $? -eq 0 ]]; then
+					MESSAGES="CREATE BACKUP DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [OK] : CEATE BACKUP DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup " >> $DOCKERME_LOG_PATH.log
+				else
+					MESSAGES="CREATING BACKUP DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [FAIL] : CEATING BACKUP DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup " >> $DOCKERME_LOG_PATH.log
+					exit
+				fi
+			fi
+		elif [[ $i -eq 6 ]]; then
+			mv $D.tar $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup/$D.tar 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="MOVE ARCHIVE FILE $D.zip TO BACKUP REPOSITORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup/$D.tar" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : MOVING ARCHIVE FILE $D.tar TO BACKUP REPOSITORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup/$D.tar" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="MOVING ARCHIVE FILE $D.zip TO BACKUP REPOSITORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup/$D.tar" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : MOVING ARCHIVE FILE $D.tar TO BACKUP REPOSITORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup/$D.tar" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 7 ]]; then
+			DOMAINE_NAME=$DOMAINE_NAME DOCKERME_CONTAINERS_UP
+		elif [[ $i -eq 8 ]]; then
+			MESSAGES="BACKUP $DOMAINE_NAME" STATUS=1 STATUS_MSG="COMPLETED" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [COMPLETED] : BACKUP $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+		fi
+	  progress_step
+	done 
+}
+DOCKERME_CONTAINERS_BACKUP_DELETE_OLD(){
+	PROGRESS_STICKY=yes
+	PROGRESS_WIDTH=100
+	progress_max_lines=1
+	PROGRESS_NUMBER_OF_STEPS=${1:-9}
+	DOCKERME_PROGRESS
+	for i in $(seq $PROGRESS_NUMBER_OF_STEPS); do
+		if [[ $i -eq 1 ]]; then
+			MESSAGES="BACKUP $DOMAINE_NAME" STATUS=1 STATUS_MSG="INITIALIZING" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [INITIALIZING] : DOCKERME UNINSTALL" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 2 ]]; then
+			DOCKERME_IF_WEBSITE_DIRECTORY_NOT_EXIST
+			MESSAGES="CHECK DOMAINE_NAME=$DOMAINE_NAME" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+		elif [[ $i -eq 3 ]]; then
+			DOMAINE_NAME=$DOMAINE_NAME DOCKERME_CONTAINERS_DOWN
+		elif [[ $i -eq 4 ]]; then
+			cd $HOME_PATH_DIRECTORY/$DOMAINE_NAME
+			tar --exclude='backups' -cf $D.tar * 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="CREATE ARCHIVE FILE $D.tar" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : CREATE ARCHIVE FILE $D.tar" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="CREATING ARCHIVE FILE $D.tar" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : CREATING ARCHIVE FILE $D.tar" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 5 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			if [ -d $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup ]; then
+				MESSAGES="CHECK BACKUP DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : CHECK BACKUP DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup " >> $DOCKERME_LOG_PATH.log
+			else
+				mkdir $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup
+				if [[ $? -eq 0 ]]; then
+					MESSAGES="CREATE BACKUP DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [OK] : CEATE BACKUP DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup " >> $DOCKERME_LOG_PATH.log
+				else
+					MESSAGES="CREATING BACKUP DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [FAIL] : CEATING BACKUP DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup " >> $DOCKERME_LOG_PATH.log
+					exit
+				fi
+			fi
+		elif [[ $i -eq 6 ]]; then
+			mv $D.tar $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup/$D.tar 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="MOVE ARCHIVE FILE $D.tar TO BACKUP REPOSITORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup/$D.tar" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : MOVING ARCHIVE FILE $D.tar TO BACKUP REPOSITORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup/$D.tar" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="MOVING ARCHIVE FILE $D.tar TO BACKUP REPOSITORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup/$D.tar" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : MOVING ARCHIVE FILE $D.tar TO BACKUP REPOSITORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup/$D.tar" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 7 ]]; then
+			DOMAINE_NAME=$DOMAINE_NAME DOCKERME_CONTAINERS_UP
+		elif [[ $i -eq 8 ]]; then
+			DOMAINE_NAME=$DOMAINE_NAME OLDER_THAN_N_DAYS=$OLDER_THAN_N_DAYS DOCKERME_DELETE_OLD_BACKUP
+		elif [[ $i -eq 9 ]]; then
+			MESSAGES="BACKUP $DOMAINE_NAME" STATUS=1 STATUS_MSG="COMPLETED" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [COMPLETED] : BACKUP $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+		fi
+	  progress_step
+	done
+}
+DOCKERME_CONTAINERS_BACKUP_LIST(){
+	DOCKERME_IF_WEBSITE_DIRECTORY_NOT_EXIST
+	ls -1 $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup 1>/dev/null 2>&1;
+	if [ $? -eq 0 ]; then
+		MESSAGES="BACKUPS LIST FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="INITIALIZING" DOCKERME_LOG_PATH_WRITE
+		echo ""
+		ls -1 $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup
+		echo ""
+		MESSAGES="BACKUPS LIST FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="COMPLETED" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [OK] : BACKUPS LIST FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+	else
+		MESSAGES="BACKUPS LIST FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="INITIALIZING" DOCKERME_LOG_PATH_WRITE
+		MESSAGES="BACKUP DIRECTORY NOT FOUND $DOMAINE_NAME" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : BACKUPS LIST FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+		exit
+	fi
+}
+DOCKERME_CONTAINERS_BACKUP_RESTORE(){
+	PROGRESS_STICKY=yes
+	PROGRESS_WIDTH=100
+	progress_max_lines=1
+	PROGRESS_NUMBER_OF_STEPS=${1:-10}
+	DOCKERME_PROGRESS
+	for i in $(seq $PROGRESS_NUMBER_OF_STEPS); do
+		if [[ $i -eq 1 ]]; then
+			MESSAGES="RESTORE BACKUP FILE $BACKUP_FILE FOR DOMAINE $DOMAINE_NAME" STATUS=1 STATUS_MSG="INITIALIZING" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [INITIALIZING] : RESTORING BACKUP FILE $BACKUP_FILE FOR DOMAINE $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 2 ]]; then
+			DOCKERME_IF_WEBSITE_DIRECTORY_NOT_EXIST
+			MESSAGES="CHECK DOMAINE_NAME $DOMAINE_NAME" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+		elif [[ $i -eq 3 ]]; then
+			if [ -f $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup/$BACKUP_FILE ]; then
+				MESSAGES="CHECK BACKUP FILE $BACKUP_FILE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+			else
+				MESSAGES="CHECK BACKUP FILE $BACKUP_FILE" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				exit
+			fi
+		elif [[ $i -eq 4 ]]; then
+			DOMAINE_NAME=$DOMAINE_NAME DOCKERME_CONTAINERS_DOWN
+		elif [[ $i -eq 5 ]]; then
+			cd $HOME_PATH_DIRECTORY/$DOMAINE_NAME 1>/dev/null 2>&1;
+			find -maxdepth 1 ! -name backup ! -name . -exec rm -rv {} \; 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="REMOVE OLD FILES FROM $HOME_PATH_DIRECTORY/$DOMAINE_NAME" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : REMOVING OLD FILES FROM $HOME_PATH_DIRECTORY/$DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="REMOVING OLD FILES" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : REMOVING OLD FILES FROM $HOME_PATH_DIRECTORY/$DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+				DOMAINE_NAME=$DOMAINE_NAME DOCKERME_CONTAINERS_UP	
+				exit
+			fi
+		elif [[ $i -eq 6 ]]; then
+			cp $HOME_PATH_DIRECTORY/$DOMAINE_NAME/backup/$BACKUP_FILE $HOME_PATH_DIRECTORY/$DOMAINE_NAME/$BACKUP_FILE
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="CREATE TEMPORARY BACKUP ARCHIVE FILE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : CREATE TEMPORARY BACKUP ARCHIVE FILE" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="CREATING TEMPORARY BACKUP ARCHIVE FILE" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : CREATING TEMPORARY BACKUP ARCHIVE FILE" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 7 ]]; then
+			tar -xvf $BACKUP_FILE 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="DECOMPRESS BACKUP ARCHIVE FILE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : DECOMPRESSING BACKUP ARCHIVE FILE" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="DECOMPRESSING TEMPORARY BACKUP ARCHIVE FILE" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : DECOMPRESSING BACKUP ARCHIVE FILE" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 8 ]]; then
+			rm $BACKUP_FILE 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="REMOVE TEMPORARY BACKUP ARCHIVE FILE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : REMOVING TEMPORARY BACKUP ARCHIVE FILE" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="REMOVING TEMPORARY BACKUP ARCHIVE FILE" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : REMOVING TEMPORARY BACKUP ARCHIVE FILE" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 9 ]]; then
+			DOMAINE_NAME=$DOMAINE_NAME DOCKERME_CONTAINERS_UP			
+		elif [[ $i -eq 10 ]]; then
+			MESSAGES="RESTORING BACKUP FILE $BACKUP_FILE FOR DOMAINE $DOMAINE_NAME" STATUS=1 STATUS_MSG="COMPLETED" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [COMPLETED] : RESTORING BACKUP FILE $BACKUP_FILE FOR DOMAINE $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+		fi
+	  progress_step
+	done 
+}
+DOCKERME_DELETE_OLD_BACKUP(){
+	. /$DOCKERME_CONFIG_PATH
+	#DOMAINE_NAME
+	#OLDER_THAN_N_DAYS
+	find $HOME_PATH_DIRECTORY/$DOMAINE_NAME/* -mtime +7 -exec rm {} \; 1>/dev/null 2>&1;
+	if [[ $? -eq 0 ]]; then
+		MESSAGES="DELETE BACKUPS OLDER THAN $OLDER_THAN_N_DAYS FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [OK] : DELETE BACKUPS OLDER THAN $OLDER_THAN_N_DAYS DAY(S) FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+	else
+		MESSAGES="DELETING BACKUPS BACKUPS OLDER THAN $OLDER_THAN_N_DAYS DAY(S) FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="WARNING" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : DELETING BACKUPS OLDER THAN $OLDER_THAN_N_DAYS DAY(S) FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+		exit
+	fi
+}
+DOCKERME_AUDITOR_DBFS(){
+	docker container rm DockerBenchForSecurity 1>/dev/null 2>&1;
+	docker run -it --net host --pid host --userns host --cap-add audit_control \
+    -e DOCKER_CONTENT_TRUST=$DOCKER_CONTENT_TRUST \
+    -v /var/lib:/var/lib \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v /usr/lib/systemd:/usr/lib/systemd \
+    -v /etc:/etc --label docker_bench_security \
+    docker/docker-bench-security
+    if [[ $? -eq 0 ]]; then
+		echo $d ": [OK] : LUNCH AUDIT DockerBenchForSecurity" >> $DOCKERME_LOG_PATH.log
+	fi
+}
+DOCKERME_AUDITOR_LYNIS(){
+	cd $DOCKERME_DIR_PATH/lynis/
+	./lynis audit system
+    if [[ $? -eq 0 ]]; then
+		echo $d ": [OK] : LUNCH AUDIT LYNIS" >> $DOCKERME_LOG_PATH.log
+	fi
+}
+DOCKERME_CONTAINERS_STOP(){
+	DOMAINE_NAME=$DOMAINE_NAME DOCKERME_IF_WEBSITE_DIRECTORY_NOT_EXIST
+	. /$DOCKERME_CONFIG_PATH
+	docker stop $(docker ps -a | grep $DOMAINE_NAME* | awk '{print $1}') 1>/dev/null 2>&1;
+	if [[ $? -eq 0 ]]; then
+		MESSAGES="DOWN CONTAINERS FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [OK] : STOP ALL CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+	else
+		MESSAGES="DOWNING CONTAINERS" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : STOP ALL CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+	fi
+}
+DOCKERME_CONTAINERS_START(){
+	DOMAINE_NAME=$DOMAINE_NAME DOCKERME_IF_WEBSITE_DIRECTORY_NOT_EXIST
+	. /$DOCKERME_CONFIG_PATH
+	cd $HOME_PATH_DIRECTORY/$DOMAINE_NAME 1>/dev/null 2>&1;
+	docker-compose down 1>/dev/null 2>&1;
+	if [[ $? -eq 0 ]]; then
+		MESSAGES="DOWNINIG ALL CONTAINERS FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [OK] : DOWNING ALL CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+	else
+		MESSAGES="DONWINIG ALL CONTAINERS FOR $DOMAINE_NAME" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : DONWINIG ALL CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+		exit
+	fi
+	docker-compose up -d 1>/dev/null 2>&1;
+	if [[ $? -eq 0 ]]; then
+		MESSAGES="UPING ALL CONTAINERS FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [OK] : STARTING ALL CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+	else
+		MESSAGES="UPING ALL CONTAINERS FOR $DOMAINE_NAME" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+		echo $d ": [FAIL] : STARTING ALL CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+		exit
+	fi
+}
+DOCKERME_CONTAINERS_CREATE_OVERRIDE(){
+	PROGRESS_STICKY=yes
+	PROGRESS_WIDTH=100
+	PROGRESS_NUMBER_OF_STEPS=${1:-11}
+	progress_line_number=1
+	DOCKERME_PROGRESS
+	for i in $(seq $PROGRESS_NUMBER_OF_STEPS); do
+		if [[ $i -eq 1 ]]; then
+			MESSAGES="CREATE CONTAINERS" STATUS=1 STATUS_MSG="INITIALIZING" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [INITIALIZING] : CREATING CONTAINERS" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 2 ]]; then
+			DOCKERME_IF_NGINX-SSL-CONTAINERS_EXIST
+			MESSAGES="CHECK NGINX-PROXY" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [OK] : CHEKING NGINX-PROXY CONTAINER" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 3 ]]; then
+			DOCKERME_IF_YML_EXIST $YML
+			MESSAGES="CHECK YML FILE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [OK] : CHEKING YML FILE $DOCKERME_YML_PATH/$YML" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 4 ]]; then
+			if [ -d $HOME_PATH_DIRECTORY/$DOMAINE_NAME ]; then
+				cd $HOME_PATH_DIRECTORY/$DOMAINE_NAME
+				docker-compose down 1>/dev/null 2>&1;
+				if [ $? -eq 0 ]; then
+					#MESSAGES="REMOVING CONTAINERS FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [OK] : REMOVING CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+				else 
+					#MESSAGES="REMOVING CONTAINERS FOR $DOMAINE_NAME" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [FAIL] : REMOVING CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+				fi
+				cd ..
+				rm -r $DOMAINE_NAME
+				if [ $? -eq 0 ]; then
+					#MESSAGES="REMOVING DIRECTORY FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [OK] : REMOVING DIRECTORY FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+				else 
+					#MESSAGES="REMOVING DIRECTORY FOR $DOMAINE_NAME" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [FAIL] : REMOVING DIRECTORY FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+				fi
+				MESSAGES="$DOMAINE_NAME ALREDY HOSTED, CLEENING UP" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : $DOMAINE_NAME ALREDY HOSTED, CLEENING UP" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="NOTHING TO CLEEN UP FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="NOTICE" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [NOTICE] : NOTHING TO CLEEN UP FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+			fi
+		elif [[ $i -eq 5 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			mkdir $HOME_PATH_DIRECTORY/$DOMAINE_NAME 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="CREATE HOME DIRECTORY" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : CREATING HOME DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="CREATING HOME DIRECTORY" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : CREATING HOME DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME : CODE CC05" >> $DOCKERME_LOG_PATH.log
+			fi
+		elif [[ $i -eq 6 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			touch $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="CREATE DOCKER-COMPOSE.YML AS EMPTY FILE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : CREATING EMPTYFILE $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="CREATE DOCKER-COMPOSE.YML AS EMPTY FILE" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : CREATING EMPTYFILE $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC06" >> $DOCKERME_LOG_PATH.log
+			fi
+		elif [[ $i -eq 7 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			cat $DOCKERME_YML_PATH/$YML > $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="COPY YML FILE IN docker-compose.yml" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : COPYING $YML INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="COPYING YML FILE IN docker-compose.yml" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : COPYING $YML INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC07" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 8 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			cd $HOME_PATH_DIRECTORY/$DOMAINE_NAME
+			sudo sed -i -e  's/$host/'$DOMAINE_NAME'/g' docker-compose.yml 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				sudo sed -i -e 's|$path|'$HOME_PATH_DIRECTORY'|g' docker-compose.yml 1>/dev/null 2>&1;
+				if [[ $? -eq 0 ]]; then
+					MESSAGES="COMPOSE docker-compose.yml" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [OK] : COMPOSE $YML INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml" >> $DOCKERME_LOG_PATH.log
+				else
+					MESSAGES="COMPOSING YML FILE" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [FAIL] : COMPOSING YML FILE INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC08" >> $DOCKERME_LOG_PATH.log
+					exit
+				fi
+
+			else
+				echo " * COMPOSING YML FILE\t: [FAIL]"
+				echo $d ": [FAIL] : COMPOSING YML FILE INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC08+" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 9 ]]; then
+			YML="$YML" DOCKERME_CREATE_CONTAINERS_SPECIAL_CONFIG
+		elif [[ $i -eq 10 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			cd $HOME_PATH_DIRECTORY/$DOMAINE_NAME
+			docker-compose up -d 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="START CONTAINERS FROM LOCAL DOCKER-COMPOSE.YML" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : STARTING CONTAINERS FROM $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="STARTING CONTAINERS FROM LOCAL DOCKER-COMPOSE.YML" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : STARTING CONTAINERS FROM $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC09" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 11 ]]; then
+			MESSAGES="CREATE CONTAINERS" STATUS=1 STATUS_MSG="COMPLETED" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [COMPLETED] : CREATE CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+		fi
+		progress_step
+	done
+}
+DOCKERME_CONTAINERS_CREATE_OVERRIDE_LOCAL(){
+	PROGRESS_STICKY=yes
+	PROGRESS_WIDTH=100
+	PROGRESS_NUMBER_OF_STEPS=${1:-12}
+	progress_line_number=1
+	DOCKERME_PROGRESS
+	for i in $(seq $PROGRESS_NUMBER_OF_STEPS); do
+		if [[ $i -eq 1 ]]; then
+			MESSAGES="CREATE CONTAINERS" STATUS=1 STATUS_MSG="INITIALIZING" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [INITIALIZING] : CREATING CONTAINERS" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 2 ]]; then
+			DOCKERME_IF_NGINX-SSL-CONTAINERS_EXIST
+			MESSAGES="CHECK NGINX-PROXY" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [OK] : CHEKING NGINX-PROXY CONTAINER" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 3 ]]; then
+			DOCKERME_IF_YML_EXIST $YML
+			MESSAGES="CHECK YML FILE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [OK] : CHEKING YML FILE $DOCKERME_YML_PATH/$YML" >> $DOCKERME_LOG_PATH.log
+		elif [[ $i -eq 4 ]]; then
+			if [ -d $HOME_PATH_DIRECTORY/$DOMAINE_NAME ]; then
+				cd $HOME_PATH_DIRECTORY/$DOMAINE_NAME
+				docker-compose down 1>/dev/null 2>&1;
+				if [ $? -eq 0 ]; then
+					#MESSAGES="REMOVING CONTAINERS FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [OK] : REMOVING CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+				else 
+					#MESSAGES="REMOVING CONTAINERS FOR $DOMAINE_NAME" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [FAIL] : REMOVING CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+				fi
+				cd ..
+				rm -r $DOMAINE_NAME
+				if [ $? -eq 0 ]; then
+					#MESSAGES="REMOVING DIRECTORY FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [OK] : REMOVING DIRECTORY FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+				else 
+					#MESSAGES="REMOVING DIRECTORY FOR $DOMAINE_NAME" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [FAIL] : REMOVING DIRECTORY FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+				fi
+				MESSAGES="$DOMAINE_NAME ALREDY HOSTED, CLEENING UP" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : $DOMAINE_NAME ALREDY HOSTED, CLEENING UP" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="NOTHING TO CLEEN UP FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="NOTICE" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [NOTICE] : NOTHING TO CLEEN UP FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+			fi
+		elif [[ $i -eq 5 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			mkdir $HOME_PATH_DIRECTORY/$DOMAINE_NAME 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="CREATE HOME DIRECTORY" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : CREATING HOME DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="CREATING HOME DIRECTORY" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : CREATING HOME DIRECTORY $HOME_PATH_DIRECTORY/$DOMAINE_NAME : CODE CC05" >> $DOCKERME_LOG_PATH.log
+			fi
+		elif [[ $i -eq 6 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			touch $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="CREATE DOCKER-COMPOSE.YML AS EMPTY FILE" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : CREATING EMPTYFILE $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="CREATE DOCKER-COMPOSE.YML AS EMPTY FILE" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : CREATING EMPTYFILE $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC06" >> $DOCKERME_LOG_PATH.log
+			fi
+		elif [[ $i -eq 7 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			cat $DOCKERME_YML_PATH/$YML > $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="COPY YML FILE IN docker-compose.yml" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : COPYING $YML INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="COPYING YML FILE IN docker-compose.yml" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : COPYING $YML INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC07" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 8 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			cd $HOME_PATH_DIRECTORY/$DOMAINE_NAME
+			sudo sed -i -e  's/$host/'$DOMAINE_NAME'/g' docker-compose.yml 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				sudo sed -i -e 's|$path|'$HOME_PATH_DIRECTORY'|g' docker-compose.yml 1>/dev/null 2>&1;
+				if [[ $? -eq 0 ]]; then
+					MESSAGES="COMPOSE docker-compose.yml" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [OK] : COMPOSE $YML INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml" >> $DOCKERME_LOG_PATH.log
+				else
+					MESSAGES="COMPOSING YML FILE" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+					echo $d ": [FAIL] : COMPOSING YML FILE INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC08" >> $DOCKERME_LOG_PATH.log
+					exit
+				fi
+
+			else
+				echo " * COMPOSING YML FILE\t: [FAIL]"
+				echo $d ": [FAIL] : COMPOSING YML FILE INTO $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC08+" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 9 ]]; then
+			YML="$YML" DOCKERME_CREATE_CONTAINERS_SPECIAL_CONFIG
+		elif [[ $i -eq 10 ]]; then
+			. /$DOCKERME_CONFIG_PATH
+			cd $HOME_PATH_DIRECTORY/$DOMAINE_NAME
+			docker-compose up -d 1>/dev/null 2>&1;
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="START CONTAINERS FROM LOCAL DOCKER-COMPOSE.YML" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : STARTING CONTAINERS FROM $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="STARTING CONTAINERS FROM LOCAL DOCKER-COMPOSE.YML" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : STARTING CONTAINERS FROM $HOME_PATH_DIRECTORY/$DOMAINE_NAME/docker-compose.yml : CODE CC09" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 11 ]]; then
+			DOMAINE_NAME=$DOMAINE_NAME YML=$YML DOCKERME_WRITE_LOCAL_ENTRY_ETC_HOST
+			if [[ $? -eq 0 ]]; then
+				MESSAGES="ADD LOCAL ENTRY IN /etc/host FOR $DOMAINE_NAME" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [OK] : ADDING LOCAL ENTRY IN /etc/host FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+			else
+				MESSAGES="ADDING LOCAL ENTRY IN /etc/host FOR $DOMAINE_NAME" STATUS=0 STATUS_MSG="FAIL" DOCKERME_LOG_PATH_WRITE
+				echo $d ": [FAIL] : ADDING LOCAL ENTRY IN /etc/host FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+				exit
+			fi
+		elif [[ $i -eq 12 ]]; then
+			MESSAGES="CREATE CONTAINERS" STATUS=1 STATUS_MSG="COMPLETED" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [COMPLETED] : CREATE CONTAINERS FOR $DOMAINE_NAME" >> $DOCKERME_LOG_PATH.log
+		fi
+		progress_step
+	done
+}
+DOCKERME_CREATE_CONTAINERS_SPECIAL_CONFIG(){
+	DOCKERME_GLOBAL_VARS
+	. /$DOCKERME_CONFIG_PATH
+	if [[ "$YML" == "wp_php7" ]]; then
+		if [[ -f "/var/dockerme/containers.conf/upload.ini" && -s "/var/dockerme/containers.conf/upload.ini" ]]; then
+			MESSAGES="USE CONFIG FOR $YML $DOCKERME_CONTAINERS_CONF/uploads.ini" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [OK] : USE CONFIG FOR $YML $DOCKERME_CONTAINERS_CONF/uploads.ini" >> $DOCKERME_LOG_PATH.log
+		else
+			cd $DOCKERME_CONTAINERS_CONF 1>/dev/null 2>&1;
+			echo "file_uploads = On" >> upload.ini
+			echo "memory_limit = 256M" >> upload.ini
+			echo "upload_max_filesize = 256M" >> upload.ini
+			echo "post_max_size = 256M" >> upload.ini
+			echo "max_execution_time = 60000" >> upload.ini
+			MESSAGES="CREATE AND USE SPECIAL CONFIG FOR $YML UNDER $DOCKERME_CONTAINERS_CONF/uploads.ini" STATUS=1 STATUS_MSG="OK" DOCKERME_LOG_PATH_WRITE
+			echo $d ": [OK] : CREATE AND USE SPECIAL CONFIG FOR $YML UNDER $DOCKERME_CONTAINERS_CONF/uploads.ini" >> $DOCKERME_LOG_PATH.log
+ 		fi
+	fi
+}
+#DOCKERME_UPDATE(){
+#}
+clear
+DOCKERME_HEADER
+if [[ "$EUID" -ne 0 ]]; then 
+	echo "Please re-run as root #sudo -s"
+	exit
+fi
+DOCKERME_GLOBAL_VARS
+if [[ -z "$1" ]]; then
+	DOCKERME_SHOW_HELP
+elif [[ " $1 " = *"-i"* ]] && [[ -z "$2" ]]; then
+	DOCKERME_INSTALL
+elif [[ " $1 " = *"-yml"* ]] && [[ " $2 " = *"--list"* ]] && [[ -z "$3" ]]; then
+	DOCKERME_YML_LIST
+elif [[ " $1 " = *"-update"* ]] && [[ -z "$2" ]]; then
+ 	DOCKERME_UPDTAE
+elif [[ " $1 " = *"-log"* ]] && [[ " $2 " = *"--view"* ]] && [[ -z "$3" ]]; then
+ 	DOCKERME_LOG_PATH_VIEW
+elif [[ " $1 " = *"-log"* ]] && [[ " $2 " = *"--trancate"* ]] && [[ -z "$3" ]]; then
+ 	DOCKERME_LOG_PATH_TRUNCATE
+elif [[ " $1 " = *"-c"* ]] && [[ -n "$2" ]] && [[ -n "$3" ]] && [[ -z "$4" ]]; then
+ 	DOMAINE_NAME=$2 YML=$3 DOCKERME_CONTAINERS_CREATE
+elif [[ " $1 " = *"-o"* ]] && [[ -n "$2" ]] && [[ -n "$3" ]] && [[ -z "$4" ]]; then
+ 	DOMAINE_NAME=$2 YML=$3 DOCKERME_CONTAINERS_CREATE_OVERRIDE
+elif [[ " $1 " = *"-c"* ]] && [[ -n "$2" ]] && [[ -n "$3" ]] && [[ "$4" = *"--local"* ]] && [[ -z "$5" ]]; then
+ 	DOMAINE_NAME=$2 YML=$3 DOCKERME_CONTAINERS_CREATE_LOCAL
+elif [[ " $1 " = *"-o"* ]] && [[ -n "$2" ]] && [[ -n "$3" ]] && [[ "$4" = *"--local"* ]] && [[ -z "$5" ]]; then
+ 	DOMAINE_NAME=$2 YML=$3 DOCKERME_CONTAINERS_CREATE_OVERRIDE_LOCAL
+elif [[ " $1 " = *"-b"* ]] && [[ -n "$2" ]] && [[ -z "$3" ]]; then
+ 	DOMAINE_NAME=$2 DOCKERME_CONTAINERS_BACKUP
+elif [[ " $1 " = *"-b"* ]] && [[ -n "$2" ]] && [[ -z "$3" ]]; then
+ 	DOMAINE_NAME=$2 DOCKERME_CONTAINERS_BACKUP
+elif [[ " $1 " = *"-b"* ]] && [[ "$2" ]] && [[ "$3" ]] && [[ "$4" = *"--older"* ]] && [[ -z "$5" ]]; then
+	DOMAINE_NAME=$2 OLDER_THAN_N_DAYS=$3 DOCKERME_CONTAINERS_BACKUP_DELETE_OLD
+elif [[ " $1 " = *"-b"* ]] && [[ -n "$2" ]] && [[ "$3" = *"--list"* ]] && [[ -z "$4" ]]; then
+ 	DOMAINE_NAME=$2 DOCKERME_CONTAINERS_BACKUP_LIST
+#elif [[ " $1 " = *"-b"* ]] && [[ "$2" = *"-s"* ]] && [[ -n "$3" ]] && [[ -z "$4" ]]; then
+# 	echo "DOCKERME_BACKUPS_SCHADULED not uplemented yed!"
+#elif [[ " $1 " = *"-b"* ]] && [[ "$2" = *"-s"* ]] && [[ -n "$3" ]] && [[ -z "$4" ]]; then
+# 	echo "DOCKERME_BACKUPS_SCHADULED not implemented yet"
+#elif [[ " $1 " = *"-b"* ]] && [[ "$2" = *"-s"* ]] && [[ -n "$3" ]] && [[ "$4" = *"--list"* ]] && [[ -z "$5" ]]; then
+# 	echo "DOCKERME_BACKUPS_SCHADULED_LIST not implemented yet"
+#elif [[ " $1 " = *"-b"* ]] && [[ "$2" = *"-s"* ]] && [[ -n "$3" ]] && [[ "$4" = *"--add"* ]] && [[ -z "$5" ]]; then
+# 	echo "DOCKERME_BACKUPS_SCHADULED_ADD not implemented yet"
+elif [[ " $1 " = *"-b"* ]] && [[ "$2" = *"-s"* ]] && [[ -n "$3" ]] && [[ "$4" = *"--delete"* ]] && [[ -z "$5" ]]; then
+ 	echo "DOCKERME_BACKUPS_SCHADULED_DELEATE not implemented yet"
+elif [[ " $1 " = *"-r"* ]] && [[ -n "$2" ]] && [[ -n "$3" ]] && [[ -z "$4" ]]; then
+ 	DOMAINE_NAME=$2 BACKUP_FILE=$3 DOCKERME_CONTAINERS_BACKUP_RESTORE
+elif [[ " $1 " = *"-r"* ]] && [[ "$2" ]] && [[ "$3" ]] && [[ -z "$4" ]]; then
+ 	echo "DOCKERME_RESTORE_LIST not implemented yet"
+elif [[ " $1 " = *"-rm"* ]] && [[ "$2" ]] && [[ -z "$3" ]]; then
+ 	DOMAINE_NAME=$2 DOCKERME_CONTAINERS_REMOVE
+elif [[ " $1 " = *"-up"* ]] && [[ "$2" ]] && [[ -z "$3" ]]; then
+ 	DOMAINE_NAME=$2 DOCKERME_CONTAINERS_UP
+elif [[ " $1 " = *"-down"* ]] && [[ "$2" ]] && [[ -z "$3" ]]; then
+ 	DOMAINE_NAME=$2 DOCKERME_CONTAINERS_DOWN
+elif [[ " $1 " = *"-start"* ]] && [[ "$2" ]] && [[ -z "$3" ]]; then
+ 	DOMAINE_NAME=$2 DOCKERME_CONTAINERS_START
+elif [[ " $1 " = *"-stop"* ]] && [[ "$2" ]] && [[ -z "$3" ]]; then
+ 	DOMAINE_NAME=$2 DOCKERME_CONTAINERS_STOP
+elif [[ " $1 " = *"-auditor"* ]] && [[ "$2" = *"--dbfs"* ]] && [[ -z "$3" ]]; then
+ 	DOCKERME_AUDITOR_DBFS
+elif [[ " $1 " = *"-auditor"* ]] && [[ "$2" = *"--lynis"* ]] && [[ -z "$3" ]]; then
+ 	DOCKERME_AUDITOR_LYNIS
+elif [[ " $1 " = *"-u"* ]] && [[ "$2" = *"--all"* ]] && [[ -z "$3" ]]; then
+ 	DOCKERME_UNINSTALL
+else
+	DOCKERME_SHOW_HELP	
+fi

@@ -1,0 +1,43 @@
+version: "2"
+services:
+  $host_mysql:
+    container_name: $host_mysql
+    image: mysql:5.7.23
+    #restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+    volumes:
+      - $path/$host/mysql:/var/lib/mysql  
+    network_mode: bridge
+
+  $host_wp:
+    container_name: $host_wp
+    image: wordpress:4.9.8-php7.0-apache
+    #restart: always
+    volumes:
+      - $path/$host/public_html:/var/www/html
+    links:
+      - $host_mysql:mysql
+    environment:
+      WORDPRESS_DB_PASSWORD: password    
+      VIRTUAL_HOST: www.$host, $host
+      LETSENCRYPT_HOST: www.$host, $host
+      LETSENCRYPT_EMAIL: mindengineering.tn@gmail.com
+    network_mode: bridge
+
+  $host_phpmyadmin:
+    container_name: $host_phpmyadmin
+    image: phpmyadmin/phpmyadmin
+    #restart: always
+    links:
+      - $host_mysql:mysql
+    environment:
+      VIRTUAL_HOST: phpmyadmin.$host
+      LETSENCRYPT_HOST: phpmyadmin.$host
+      LETSENCRYPT_EMAIL: mindengineering.tn@gmail.com
+      MYSQL_USERNAME: root
+      MYSQL_ROOT_PASSWORD: password
+      PMA_HOST: mysql
+    network_mode: bridge
+    
+    

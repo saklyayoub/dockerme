@@ -1,0 +1,14 @@
+version: "2"
+services:
+  $host:
+    container_name: $host
+    image: mattrayner/lamp
+    #restart: always
+    volumes:
+      - $path/$host/public_html:/var/www/html
+      - $path/$host/mysql:/var/lib/mysql
+    environment:
+      VIRTUAL_HOST: www.$host, $host
+      LETSENCRYPT_HOST: www.$host, $host
+      LETSENCRYPT_EMAIL: mindengineering.tn@gmail.com
+    network_mode: bridge

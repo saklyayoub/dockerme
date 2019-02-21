@@ -1,0 +1,14 @@
+version: '2'
+
+services:
+  $host_jenkins:
+    image: bitnami/jenkins:latest
+    ports:
+      - '8081:8080'
+      - '4431:8443'
+    #environment:
+    #VIRTUAL_HOST: www.$host, $host
+    #LETSENCRYPT_HOST: $host
+    #LETSENCRYPT_EMAIL: mindengineering.tn@gmail.com
+    volumes:
+      - $path/$host/jenkins_data:/bitnami
